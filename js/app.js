@@ -4,9 +4,14 @@
 const $ = (id) => document.getElementById(id);
 
 const state = {
-    art: {},    // slot -> { file, img, rot }
+    images: [], // image library: { id, file, img }
+    nextImageId: 1,
+    art: {},    // slot -> { imageId, rot, mode }
     pages: [],
 };
+
+const ART_MODES = { fill: 'Fill', fit: 'Fit', stretch: 'Stretch', extend: 'Extend' };
+const IMAGE_DRAG_TYPE = 'application/x-pnp-image';
 
 const STYLE_HINTS = {
     tuck: 'One piece with a tuck-in lid and bottom. The usual card-deck box.',
@@ -48,7 +53,11 @@ function paperSize() {
     return { w: num('paperW', 210), h: num('paperH', 297) };
 }
 
-// ---- Artwork slots -----------------------------------------------------------------------
+// ---- Artwork --------------------------------------------------------------------------------
+
+// Images live in a library; each panel slot points at one of them, with its
+// own rotation and fit mode, so the same image can serve several panels and
+// the choice can be changed any time.
 
 function loadImage(file) {
     return new Promise((resolve, reject) => {
@@ -60,60 +69,222 @@ function loadImage(file) {
     });
 }
 
-async function setArt(slot, file, rot = 0) {
-    try {
-        state.art[slot] = { file, img: await loadImage(file), rot };
-    } catch (err) {
-        PnP.toast(err.message, 'error');
+const imageById = (id) => state.images.find((im) => im.id === id);
+
+// Add files to the library; returns the images that loaded.
+async function addImages(files) {
+    const added = [];
+    for (const file of files.filter((f) => f.type.startsWith('image/'))) {
+        try {
+            const entry = { id: state.nextImageId++, file, img: await loadImage(file) };
+            state.images.push(entry);
+            added.push(entry);
+        } catch (err) {
+            PnP.toast(err.message, 'error');
+        }
     }
+    return added;
+}
+
+// New images go to the current style's empty panels in order; any extras
+// stay in the library for picking later.
+async function importImages(files) {
+    const added = await addImages(files);
+    const empty = BOX_STYLES[$('boxStyle').value].slots.filter((s) => !state.art[s]);
+    added.slice(0, empty.length).forEach((im, i) => { state.art[empty[i]] = { imageId: im.id, rot: 0, mode: 'fill' }; });
     renderSlots();
     schedule();
 }
 
-function pickImage(onFile) {
+// Point a slot at a library image, keeping its rotation and mode.
+function assignImage(slot, imageId) {
+    const prev = state.art[slot];
+    state.art[slot] = { imageId, rot: prev ? prev.rot : 0, mode: prev ? prev.mode : 'fill' };
+    renderSlots();
+    schedule();
+}
+
+async function assignFile(slot, file) {
+    const [im] = await addImages([file]);
+    if (im) assignImage(slot, im.id);
+}
+
+function removeImage(id) {
+    state.images = state.images.filter((im) => im.id !== id);
+    Object.keys(state.art).forEach((slot) => { if (state.art[slot].imageId === id) delete state.art[slot]; });
+    renderSlots();
+    schedule();
+}
+
+// slot -> { img, rot, mode }, the form the renderer draws.
+function resolvedArt() {
+    const out = {};
+    Object.entries(state.art).forEach(([slot, a]) => {
+        const im = imageById(a.imageId);
+        if (im) out[slot] = { img: im.img, rot: a.rot, mode: a.mode };
+    });
+    return out;
+}
+
+function pickFiles(onFiles, multiple = false) {
     const input = document.createElement('input');
     input.type = 'file';
     input.accept = 'image/*';
-    input.addEventListener('change', () => input.files[0] && onFile(input.files[0]));
+    input.multiple = multiple;
+    input.addEventListener('change', () => input.files.length && onFiles([...input.files]));
     input.click();
 }
 
+// A drop carries either a library image (dragged from the sidebar) or files.
+function readDrop(e) {
+    const id = parseInt(e.dataTransfer.getData(IMAGE_DRAG_TYPE), 10);
+    if (imageById(id)) return { imageId: id };
+    const file = [...e.dataTransfer.files].find((f) => f.type.startsWith('image/'));
+    return file ? { file } : null;
+}
+
+function dropOnSlot(slot, drop) {
+    if (drop.imageId) assignImage(slot, drop.imageId);
+    else assignFile(slot, drop.file);
+}
+
+function acceptDrops(el, onDrop) {
+    el.addEventListener('dragover', (e) => { e.preventDefault(); el.classList.add('dragover'); });
+    el.addEventListener('dragleave', () => el.classList.remove('dragover'));
+    el.addEventListener('drop', (e) => {
+        e.preventDefault();
+        el.classList.remove('dragover');
+        const drop = readDrop(e);
+        if (drop) onDrop(drop, e);
+    });
+}
+
+function thumbImg(im, rot = 0) {
+    const img = document.createElement('img');
+    img.src = im.img.src;
+    img.alt = '';
+    img.style.transform = `rotate(${rot}deg)`;
+    return img;
+}
+
+function renderLibrary() {
+    const lib = $('artLibrary');
+    lib.innerHTML = '';
+    lib.hidden = state.images.length === 0;
+    state.images.forEach((im) => {
+        const used = Object.values(state.art).some((a) => a.imageId === im.id);
+        const tile = document.createElement('div');
+        tile.className = 'art-tile' + (used ? ' used' : '');
+        tile.title = `${im.file.name} — drag onto a panel`;
+        tile.draggable = true;
+        tile.addEventListener('dragstart', (e) => {
+            e.dataTransfer.setData(IMAGE_DRAG_TYPE, String(im.id));
+            e.dataTransfer.effectAllowed = 'copy';
+        });
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.textContent = '✕';
+        remove.title = 'Remove from library';
+        remove.setAttribute('aria-label', `Remove ${im.file.name}`);
+        remove.addEventListener('click', () => removeImage(im.id));
+        tile.append(thumbImg(im), remove);
+        lib.append(tile);
+    });
+}
+
+// Popover under a slot row listing the library, plus Browse… and None.
+function openPicker(row, slot) {
+    closePicker();
+    const pop = document.createElement('div');
+    pop.className = 'art-picker';
+    const current = state.art[slot]?.imageId;
+    state.images.forEach((im) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'art-tile' + (im.id === current ? ' selected' : '');
+        b.title = im.file.name;
+        b.append(thumbImg(im));
+        b.addEventListener('click', () => { closePicker(); assignImage(slot, im.id); });
+        pop.append(b);
+    });
+    const action = (text, onClick) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'art-picker-action';
+        b.textContent = text;
+        b.addEventListener('click', () => { closePicker(); onClick(); });
+        pop.append(b);
+    };
+    action('Browse…', () => pickFiles(([file]) => assignFile(slot, file)));
+    if (current) action('None', () => { delete state.art[slot]; renderSlots(); schedule(); });
+    row.append(pop);
+}
+
+function closePicker() {
+    document.querySelectorAll('.art-picker').forEach((p) => p.remove());
+}
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('.art-picker, .slot-thumb')) closePicker();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closePicker(); });
+
 function renderSlots() {
+    closePicker();
+    renderLibrary();
     const list = $('slotList');
     list.innerHTML = '';
     BOX_STYLES[$('boxStyle').value].slots.forEach((slot) => {
         const a = state.art[slot];
+        const im = a && imageById(a.imageId);
         const row = document.createElement('div');
         row.className = 'slot';
-        const thumb = document.createElement('div');
-        thumb.className = 'slot-thumb' + (a ? '' : ' empty');
-        if (a) {
-            const img = document.createElement('img');
-            img.src = a.img.src;
-            img.alt = '';
-            img.style.transform = `rotate(${a.rot}deg)`;
-            thumb.append(img);
-        }
+        acceptDrops(row, (drop) => dropOnSlot(slot, drop));
+
+        const thumb = document.createElement('button');
+        thumb.type = 'button';
+        thumb.className = 'slot-thumb' + (im ? '' : ' empty');
+        thumb.title = 'Choose image';
+        thumb.setAttribute('aria-label', `Choose image: ${SLOT_LABELS[slot]}`);
+        if (im) thumb.append(thumbImg(im, a.rot));
+        else thumb.textContent = '+';
+        thumb.addEventListener('click', () => {
+            if (row.querySelector('.art-picker')) closePicker();
+            else if (state.images.length) openPicker(row, slot);
+            else pickFiles(([file]) => assignFile(slot, file));
+        });
+
+        const info = document.createElement('div');
+        info.className = 'slot-info';
         const name = document.createElement('span');
         name.className = 'slot-name';
         name.textContent = SLOT_LABELS[slot];
+        info.append(name);
+        if (im) {
+            const mode = document.createElement('select');
+            mode.className = 'slot-mode';
+            mode.dataset.persist = 'false';
+            mode.setAttribute('aria-label', `Fit mode: ${SLOT_LABELS[slot]}`);
+            Object.entries(ART_MODES).forEach(([value, label]) => mode.append(new Option(label, value, false, value === a.mode)));
+            mode.addEventListener('change', () => { a.mode = mode.value; schedule(); });
+            info.append(mode);
+        }
+
         const actions = document.createElement('div');
         actions.className = 'slot-actions';
-        const button = (text, label, onClick) => {
-            const b = document.createElement('button');
-            b.type = 'button';
-            b.textContent = text;
-            b.title = label;
-            b.setAttribute('aria-label', `${label}: ${SLOT_LABELS[slot]}`);
-            b.addEventListener('click', onClick);
-            actions.append(b);
-        };
-        button(a ? 'Change' : 'Add', a ? 'Change image' : 'Add image', () => pickImage((file) => setArt(slot, file, a ? a.rot : 0)));
-        if (a) {
+        if (im) {
+            const button = (text, label, onClick) => {
+                const b = document.createElement('button');
+                b.type = 'button';
+                b.textContent = text;
+                b.title = label;
+                b.setAttribute('aria-label', `${label}: ${SLOT_LABELS[slot]}`);
+                b.addEventListener('click', onClick);
+                actions.append(b);
+            };
             button('⟳', 'Rotate 90°', () => { a.rot = (a.rot + 90) % 360; renderSlots(); schedule(); });
-            button('✕', 'Remove image', () => { delete state.art[slot]; renderSlots(); schedule(); });
+            button('✕', 'Clear panel', () => { delete state.art[slot]; renderSlots(); schedule(); });
         }
-        row.append(thumb, name, actions);
+        row.append(thumb, info, actions);
         list.append(row);
     });
 }
@@ -185,7 +356,7 @@ function render() {
         const fig = document.createElement('figure');
         fig.className = 'sheet';
         const canvas = document.createElement('canvas');
-        const k = drawPagePreview(canvas, page, { paper, art: state.art, opts, maxWidth, showLabels: $('showLabels').checked });
+        const k = drawPagePreview(canvas, page, { paper, art: resolvedArt(), opts, maxWidth, showLabels: $('showLabels').checked });
         attachDrop(canvas, page, k);
         const cap = document.createElement('figcaption');
         cap.textContent = `Page ${i + 1} · ${page.items.map((it) => it.piece.name).join(' + ')}`;
@@ -194,21 +365,13 @@ function render() {
     });
 }
 
-// Dropping an image on a panel assigns it to that panel's artwork slot.
+// Dropping an image (a file, or one dragged from the library) on a panel
+// assigns it to that panel's artwork slot.
 function attachDrop(canvas, page, k) {
-    canvas.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        canvas.classList.add('dragover');
-    });
-    canvas.addEventListener('dragleave', () => canvas.classList.remove('dragover'));
-    canvas.addEventListener('drop', (e) => {
-        e.preventDefault();
-        canvas.classList.remove('dragover');
-        const file = [...e.dataTransfer.files].find((f) => f.type.startsWith('image/'));
-        if (!file) return;
+    acceptDrops(canvas, (drop, e) => {
         const rect = canvas.getBoundingClientRect();
         const slot = slotAt(page, (e.clientX - rect.left) / k, (e.clientY - rect.top) / k);
-        if (slot) setArt(slot, file, state.art[slot]?.rot || 0);
+        if (slot) dropOnSlot(slot, drop);
         else PnP.toast('Drop the image onto a printable panel (front, back, sides, top…).', 'error');
     });
 }
@@ -230,13 +393,36 @@ $('thicknessPreset').addEventListener('change', () => {
 $('cardThickness').addEventListener('input', syncThicknessPreset);
 $('thicknessPreset').dataset.persist = 'false';
 
+// ---- Deck thickness ------------------------------------------------------------------------
+
+// Whole-deck thickness is cards × thickness per card. It's derived (not
+// saved); typing it sets the per-card value instead, since measuring the
+// whole deck is far more precise than measuring one card.
+let editingDeck = false;
+
+function syncDeckThickness() {
+    if (editingDeck) return; // don't rewrite the field the user is typing in
+    $('deckThickness').value = +(num('cardCount', 1) * num('cardThickness', 0.32)).toFixed(2);
+}
+
+$('deckThickness').addEventListener('input', () => {
+    const total = num('deckThickness');
+    const count = num('cardCount');
+    if (!(total > 0) || !(count > 0)) return;
+    editingDeck = true;
+    $('cardThickness').value = +(total / count).toFixed(4);
+    $('cardThickness').dispatchEvent(new Event('input', { bubbles: true }));
+    editingDeck = false;
+});
+['cardCount', 'cardThickness'].forEach((id) => $(id).addEventListener('input', syncDeckThickness));
+
 // ---- Export --------------------------------------------------------------------------------
 
 $('downloadPdf').addEventListener('click', async () => {
     const btn = $('downloadPdf');
     btn.disabled = true;
     try {
-        const bytes = await buildPdf(state.pages, paperSize(), state.art, readOptions(), (m) => setStatus(m, 'processing'));
+        const bytes = await buildPdf(state.pages, paperSize(), resolvedArt(), readOptions(), (m) => setStatus(m, 'processing'));
         PnP.downloadBlob(new Blob([bytes], { type: 'application/pdf' }), `${$('boxStyle').value}-box.pdf`);
         setStatus('');
     } catch (err) {
@@ -250,7 +436,11 @@ $('downloadPdf').addEventListener('click', async () => {
 
 $('downloadSvg').addEventListener('click', async () => {
     const paper = paperSize();
-    const svgs = state.pages.map((page) => buildSvg(page, paper));
+    const machineMargin = num('machineMargin');
+    if (state.pages.some((page) => linesInDeadMargin(page, paper, machineMargin))) {
+        PnP.toast('Some lines fall inside the cutting machine’s dead margin and won’t be cut. Widen the printer margin.', 'error');
+    }
+    const svgs = state.pages.map((page) => buildSvg(page, paper, machineMargin));
     const base = `${$('boxStyle').value}-box-cut`;
     if (svgs.length === 1) {
         PnP.downloadBlob(new Blob([svgs[0]], { type: 'image/svg+xml' }), `${base}.svg`);
@@ -271,39 +461,56 @@ PnP.units.onChange(schedule);
 
 PnP.bindPreset($('cardPreset'), $('cardW'), $('cardH'), 'card');
 PnP.bindPreset($('paperPreset'), $('paperW'), $('paperH'), 'paper');
-PnP.settings.onApply(() => { syncThicknessPreset(); renderSlots(); });
+PnP.bindMachinePreset($('machinePreset'), $('machineMargin'));
+PnP.settings.onApply(() => { syncThicknessPreset(); syncDeckThickness(); renderSlots(); });
 
 // Images from other tools fill the empty slots of the current style in order.
-async function fillSlots(files) {
-    const empty = BOX_STYLES[$('boxStyle').value].slots.filter((s) => !state.art[s]);
-    const images = files.filter((f) => f.type.startsWith('image/'));
-    for (let i = 0; i < Math.min(empty.length, images.length); i++) await setArt(empty[i], images[i]);
-    if (images.length > empty.length) PnP.toast(`Used ${empty.length} of ${images.length} images — there were no more empty panels.`, 'info');
-}
-PnP.importButton($('importSlot'), fillSlots);
+PnP.dropzone($('artDrop'), {
+    input: $('artInput'),
+    accept: ['image/png', 'image/jpeg', 'image/webp'],
+    onFiles: importImages,
+});
+PnP.importButton($('importSlot'), importImages);
 
+// Project files hold the library in order; slots refer to images by index.
 let projectFiles = [];
 PnP.init({
     tool: 'PnPTuckBox',
     project: {
-        getFiles: () => Object.entries(state.art).map(([slot, a]) => ({ name: a.file.name, blob: a.file, role: slot })),
-        getState: () => ({ rotations: Object.fromEntries(Object.entries(state.art).map(([slot, a]) => [slot, a.rot])) }),
+        getFiles: () => state.images.map((im) => ({ name: im.file.name, blob: im.file })),
+        getState: () => ({
+            art: Object.fromEntries(Object.entries(state.art).map(([slot, a]) => [slot, {
+                image: state.images.findIndex((im) => im.id === a.imageId), rot: a.rot, mode: a.mode,
+            }])),
+        }),
         setFiles: (files) => { projectFiles = files; },
         setState: async (saved) => {
+            state.images = [];
             state.art = {};
-            const rotations = (saved && saved.rotations) || {};
-            for (const f of projectFiles) {
-                if (f.pnpRole) await setArt(f.pnpRole, f, rotations[f.pnpRole] || 0);
+            const images = [];
+            for (const f of projectFiles) images.push((await addImages([f]))[0]);
+            if (saved && saved.art) {
+                Object.entries(saved.art).forEach(([slot, a]) => {
+                    const im = images[a.image];
+                    if (im) state.art[slot] = { imageId: im.id, rot: a.rot || 0, mode: ART_MODES[a.mode] ? a.mode : 'fill' };
+                });
+            } else {
+                // Older projects: one file per slot, named by its role.
+                const rotations = (saved && saved.rotations) || {};
+                projectFiles.forEach((f, i) => {
+                    if (f.pnpRole && images[i]) state.art[f.pnpRole] = { imageId: images[i].id, rot: rotations[f.pnpRole] || 0, mode: 'fill' };
+                });
             }
             renderSlots();
             schedule();
         },
     },
-    hasUnsavedWork: () => Object.keys(state.art).length > 0,
+    hasUnsavedWork: () => state.images.length > 0,
 });
 
-PnP.handoff.receive((items) => fillSlots(PnP.itemsToFiles(items)));
+PnP.handoff.receive((items) => importImages(PnP.itemsToFiles(items)));
 
 syncThicknessPreset();
+syncDeckThickness();
 renderSlots();
 render();

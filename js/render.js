@@ -107,23 +107,118 @@ function drawPieceArt(ctx, piece, art, opts) {
         ctx.restore();
     }
 
-    piece.panels.forEach((panel) => {
-        const a = panel.slot && art[panel.slot];
-        if (!a) return;
-        const { x, y, w, h } = panel.box;
-        const rot = ((panel.artRot || 0) + (a.rot || 0)) % 360;
-        const img = a.img;
-        ctx.save();
-        ctx.clip(polyPath(panel.poly));
-        ctx.translate(x + w / 2, y + h / 2);
-        ctx.rotate((rot * Math.PI) / 180);
-        // Cover the panel: in the rotated frame the target box is swapped for 90/270.
-        const tw = rot % 180 ? h : w;
-        const th = rot % 180 ? w : h;
-        const s = Math.max(tw / img.width, th / img.height);
-        ctx.drawImage(img, (-img.width * s) / 2, (-img.height * s) / 2, img.width * s, img.height * s);
-        ctx.restore();
-    });
+    const withArt = piece.panels
+        .map((panel) => ({ panel, a: panel.slot && art[panel.slot] }))
+        .filter(({ a }) => a);
+    const b = Math.max(0, opts.bleed);
+
+    // Artwork inside its panel.
+    withArt.forEach(({ panel, a }) => drawPanelArt(ctx, panel, a, polyPath(panel.poly), b));
+
+    // Artwork bleed: each panel's art continues past the cut line, but never
+    // over another part of the piece (flaps keep the background). Corners go
+    // first so that where two panels meet, the edge strips win.
+    if (b > 0 && withArt.length) {
+        const outside = new Path2D();
+        outside.rect(-1e4, -1e4, 2e4, 2e4);
+        piece.cuts.forEach((loop) => outside.addPath(polyPath(loop)));
+        const grown = ({ x, y, w, h }) => {
+            const p = new Path2D();
+            p.rect(x - b, y - b, w + 2 * b, h + 2 * b);
+            return p;
+        };
+        const strips = ({ x, y, w, h }) => {
+            const p = new Path2D();
+            p.rect(x, y - b, w, h + 2 * b);
+            p.rect(x - b, y, w + 2 * b, h);
+            return p;
+        };
+        [grown, strips].forEach((region) => withArt.forEach(({ panel, a }) => {
+            ctx.save();
+            ctx.clip(outside, 'evenodd');
+            drawPanelArt(ctx, panel, a, region(panel.box), b);
+            ctx.restore();
+        }));
+    }
+}
+
+// One panel's art, clipped to `clip`, covering the panel box plus `bleed`.
+function drawPanelArt(ctx, panel, a, clip, bleed) {
+    const { x, y, w, h } = panel.box;
+    const rot = ((panel.artRot || 0) + (a.rot || 0)) % 360;
+    ctx.save();
+    ctx.clip(clip);
+    ctx.translate(x + w / 2, y + h / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    // In the rotated frame the target box is swapped for 90/270.
+    const tw = rot % 180 ? h : w;
+    const th = rot % 180 ? w : h;
+    drawFitted(ctx, a.img, tw, th, a.mode || 'fill', bleed);
+    ctx.restore();
+}
+
+// Draw `img` centred on the origin into a tw × th box:
+//   fill     cover the box, cropping the excess
+//   fit      whole image inside the box (background shows around it)
+//   stretch  exactly the box, ignoring the aspect ratio
+//   extend   fit, then stretch the image's outermost pixels out to the box edges
+// Where the art reaches a box edge, it continues `bleed` further out: with
+// the image itself if it overflows (fill), else by stretching its edge pixels.
+function drawFitted(ctx, img, tw, th, mode, bleed = 0) {
+    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+    let dw = tw, dh = th;
+    if (mode !== 'stretch') {
+        const s = mode === 'fill' ? Math.max(tw / iw, th / ih) : Math.min(tw / iw, th / ih);
+        dw = iw * s;
+        dh = ih * s;
+    }
+    // How far the art must reach on each axis: past the box by the bleed,
+    // except where Fit leaves the background showing.
+    const eps = 1e-3;
+    const ex = mode === 'fit' && dw < tw - eps ? dw / 2 : Math.max(dw / 2, tw / 2 + bleed);
+    const ey = mode === 'fit' && dh < th - eps ? dh / 2 : Math.max(dh / 2, th / 2 + bleed);
+    const bx = ex - dw / 2, by = ey - dh / 2;
+    if (bx > eps || by > eps) {
+        const e = edgeStrips(img);
+        const o = Math.min(0.5, dw / 2, dh / 2); // overlap under the image so no anti-aliased seam shows
+        if (bx > eps) {
+            ctx.drawImage(e.left, -ex, -dh / 2, bx + o, dh);
+            ctx.drawImage(e.right, dw / 2 - o, -dh / 2, bx + o, dh);
+        }
+        if (by > eps) {
+            ctx.drawImage(e.top, -dw / 2, -ey, dw, by + o);
+            ctx.drawImage(e.bottom, -dw / 2, dh / 2 - o, dw, by + o);
+        }
+        if (bx > eps && by > eps) {
+            ctx.drawImage(e.tl, -ex, -ey, bx + o, by + o);
+            ctx.drawImage(e.tr, dw / 2 - o, -ey, bx + o, by + o);
+            ctx.drawImage(e.bl, -ex, dh / 2 - o, bx + o, by + o);
+            ctx.drawImage(e.br, dw / 2 - o, dh / 2 - o, bx + o, by + o);
+        }
+    }
+    ctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+}
+
+// One-pixel edge rows/columns (and corner pixels) of an image as their own canvases, so stretching
+// them never samples neighbouring pixels. Cached per image.
+const edgeStripCache = new WeakMap();
+function edgeStrips(img) {
+    let e = edgeStripCache.get(img);
+    if (e) return e;
+    const iw = img.naturalWidth || img.width, ih = img.naturalHeight || img.height;
+    const strip = (sx, sy, sw, sh) => {
+        const c = document.createElement('canvas');
+        c.width = sw;
+        c.height = sh;
+        c.getContext('2d').drawImage(img, sx, sy, sw, sh, 0, 0, sw, sh);
+        return c;
+    };
+    e = {
+        left: strip(0, 0, 1, ih), right: strip(iw - 1, 0, 1, ih), top: strip(0, 0, iw, 1), bottom: strip(0, ih - 1, iw, 1),
+        tl: strip(0, 0, 1, 1), tr: strip(iw - 1, 0, 1, 1), bl: strip(0, ih - 1, 1, 1), br: strip(iw - 1, ih - 1, 1, 1),
+    };
+    edgeStripCache.set(img, e);
+    return e;
 }
 
 // ---- Preview ---------------------------------------------------------------------------
@@ -277,28 +372,34 @@ async function buildPdf(pages, paper, art, opts, onProgress) {
 
 // ---- SVG cut file -------------------------------------------------------------------------
 
-function buildSvg(page, paper) {
-    const f = (v) => +v.toFixed(3);
-    const cut = [];
-    const score = [];
-    page.items.forEach((item) => {
-        const map = toPage(item);
-        item.piece.cuts.forEach((loop) => {
-            cut.push(`  <path d="${loop.map(map).map(([x, y], i) => `${i ? 'L' : 'M'}${f(x)} ${f(y)}`).join(' ')} Z"/>`);
-        });
-        item.piece.folds.forEach(([a, b]) => {
-            const [ax, ay] = map(a), [bx, by] = map(b);
-            score.push(`  <line x1="${f(ax)}" y1="${f(ay)}" x2="${f(bx)}" y2="${f(by)}"/>`);
-        });
+// Sized to the machine's reachable area (paper minus dead margin) with a
+// paper guide around it; see PnP.cutSvg.
+function buildSvg(page, paper, machineMargin) {
+    // Score is orange like PnPCut's, so it doesn't share the guide's blue.
+    // Solid, not dashed: the machine scores it either way.
+    return PnP.cutSvg({
+        paperW: paper.w,
+        paperH: paper.h,
+        margin: machineMargin,
+        content: (toGuide) => {
+            const cut = [];
+            const score = [];
+            page.items.forEach((item) => {
+                const toPagePoint = toPage(item);
+                const map = (p) => toGuide(toPagePoint(p));
+                item.piece.cuts.forEach((loop) => cut.push(PnP.cutPath(loop.map(map), '#e03131')));
+                item.piece.folds.forEach(([a, b]) => score.push(PnP.cutPath([map(a), map(b)], '#e08e0b', false)));
+            });
+            return cut.concat(score).join('\n');
+        },
     });
-    return `<?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="${paper.w}mm" height="${paper.h}mm" viewBox="0 0 ${paper.w} ${paper.h}">
- <g id="cut" fill="none" stroke="#e03131" stroke-width="0.25">
-${cut.join('\n')}
- </g>
- <g id="score" fill="none" stroke="#2b6cb0" stroke-width="0.25" stroke-dasharray="2 1">
-${score.join('\n')}
- </g>
-</svg>
-`;
+}
+
+// True if any cut or fold line on the page reaches into the machine's dead margin.
+function linesInDeadMargin(page, paper, machineMargin) {
+    return page.items.some((item) => {
+        const map = toPage(item);
+        const points = item.piece.cuts.flat().concat(item.piece.folds.flat()).map(map);
+        return PnP.inDeadMargin(points, paper.w, paper.h, machineMargin);
+    });
 }
