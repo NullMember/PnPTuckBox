@@ -470,7 +470,6 @@ PnP.dropzone($('artDrop'), {
     accept: ['image/png', 'image/jpeg', 'image/webp'],
     onFiles: importImages,
 });
-PnP.importButton($('importSlot'), importImages);
 
 // Project files hold the library in order; slots refer to images by index.
 let projectFiles = [];
